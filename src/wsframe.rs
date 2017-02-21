@@ -72,7 +72,7 @@ pub struct WebSocketFrame {
 #[derive(Clone)]
 pub struct WebSocketFrameBuilder;
 impl WebSocketFrameBuilder {
-    fn from_bytes(buf: &mut Vec<u8>) -> Option<Box<WebSocketFrame>> {
+    pub fn from_bytes(buf: &mut Vec<u8>) -> Option<Box<WebSocketFrame>> {
         if buf.len() < 5 {
             return None;
         }
@@ -234,7 +234,7 @@ impl WebSocketFrame {
 }
 
 impl WebSocketFrame {
-    fn payload(&self) -> Vec<u8> {
+    pub fn payload(&self) -> Vec<u8> {
         if self.header.mask {
             self.payload_unmasked()
         } else {
@@ -242,7 +242,7 @@ impl WebSocketFrame {
         }
     }
 
-    fn to_bytes(&self) -> Vec<u8> {
+    pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::<u8>::with_capacity(self.len_as_vec());
 
         // OpCode

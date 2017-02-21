@@ -8,7 +8,6 @@ extern crate tokio_core;
 extern crate tokio_proto;
 extern crate tokio_service;
 extern crate rustc_serialize as serialize;
-extern crate simple_stream as ss;
 
 mod http;
 mod wsframe;
@@ -16,8 +15,6 @@ mod wsframe;
 use futures::{future, Future, Sink, Stream};
 use openssl::crypto::hash::{self, hash};
 use serialize::base64::{ToBase64, STANDARD};
-use ss::frame::Frame;
-use ss::frame::FrameBuilder;
 //use std::fmt::Write;
 use std::io;
 use std::ops::DerefMut;
@@ -72,7 +69,8 @@ impl Codec for WsCodec {
         let len = buf.len();
         let mut buf = buf.drain_to(len);
         let mut mutbuf = buf.get_mut();
-        let result = ss::frame::WebSocketFrameBuilder::from_bytes(mutbuf.deref_mut());
+        //let result = ss::frame::WebSocketFrameBuilder::from_bytes(mutbuf.deref_mut());
+        let result = wsframe::WebSocketFrameBuilder::from_bytes(mutbuf.deref_mut());
         if let Some(boxed_frame) = result {
             info!("WsCodec delivering good frame...");
             return Ok(Some(boxed_frame.payload()));
@@ -86,10 +84,10 @@ impl Codec for WsCodec {
 	fn encode(&mut self, msg: Self::Out, buf: &mut Vec<u8>)
 			 -> io::Result<()>
 	{
-        let frame = ss::frame::WebSocketFrame::new(
+        let frame = wsframe::WebSocketFrame::new(
             msg.as_slice(),
-            ss::frame::FrameType::Data,
-            ss::frame::OpType::Binary
+            wsframe::FrameType::Data,
+            wsframe::OpType::Binary
             );
         buf.extend(frame.to_bytes());
         Ok(())
