@@ -15,7 +15,6 @@ mod wsframe;
 use futures::{future, Future, Sink, Stream};
 use openssl::crypto::hash::{self, hash};
 use serialize::base64::{ToBase64, STANDARD};
-//use std::fmt::Write;
 use std::io;
 use std::ops::DerefMut;
 use std::str;
