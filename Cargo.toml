@@ -15,5 +15,3 @@ tokio-core = "0.1"
 tokio-service = "0.1"
 tokio-proto = "0.1"
 
-[dev-dependencies]
-rust-websocket = "0.17.1"
