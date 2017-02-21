@@ -4,6 +4,7 @@ version = "0.1.0"
 authors = ["David Ko <david@barobo.com>"]
 
 [dependencies]
+bitflags = "^0.7"
 futures = "0.1"
 httparse = "*"
 env_logger = "*"

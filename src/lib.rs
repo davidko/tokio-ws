@@ -1,8 +1,8 @@
+#[macro_use] extern crate bitflags;
 extern crate env_logger;
 extern crate futures;
 extern crate httparse;
-#[macro_use]
-extern crate log;
+#[macro_use] extern crate log;
 extern crate openssl;
 extern crate tokio_core;
 extern crate tokio_proto;
@@ -11,6 +11,7 @@ extern crate rustc_serialize as serialize;
 extern crate simple_stream as ss;
 
 mod http;
+mod wsframe;
 
 use futures::{future, Future, Sink, Stream};
 use openssl::crypto::hash::{self, hash};
