@@ -1,5 +1,6 @@
 #[macro_use] extern crate bitflags;
 extern crate env_logger;
+#[macro_use]
 extern crate futures;
 extern crate httparse;
 #[macro_use] extern crate log;
@@ -12,19 +13,23 @@ extern crate rustc_serialize as serialize;
 mod http;
 mod wsframe;
 
-use futures::{future, Future, Sink, Stream};
+use futures::{future, Async, AsyncSink, Future, Poll, Sink, StartSend, Stream};
 use openssl::crypto::hash::{self, hash};
 use serialize::base64::{ToBase64, STANDARD};
+use std::clone::Clone;
+use std::collections::VecDeque;
 use std::io;
 use std::ops::DerefMut;
 use std::str;
 use tokio_core::io::{Codec, EasyBuf};
+use tokio_core::io::{Io, Framed};
+use wsframe::WebSocketFrame;
 
 use tokio_proto::pipeline::ServerProto;
 
 static MAGIC_GUID: &'static str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
-pub struct HttpCodec;
+struct HttpCodec;
 
 impl Codec for HttpCodec {
     type In = http::Request;
@@ -59,8 +64,8 @@ impl WsCodec {
 }
 
 impl Codec for WsCodec {
-    type In = Vec<u8>;
-    type Out = Vec<u8>;
+    type In = WebSocketFrame;
+    type Out = WebSocketFrame;
 
     fn decode(&mut self, buf: &mut EasyBuf) -> io::Result<Option<Self::In>> {
         info!("Decode {} bytes.", buf.len());
@@ -72,7 +77,7 @@ impl Codec for WsCodec {
         let result = wsframe::WebSocketFrameBuilder::from_bytes(mutbuf.deref_mut());
         if let Some(boxed_frame) = result {
             info!("WsCodec delivering good frame...");
-            return Ok(Some(boxed_frame.payload()));
+            return Ok(Some(*boxed_frame));
         } else {
             //return Err(io::Error::new(io::ErrorKind::Other, "Could not parse WS data frame"));
             info!("WsCodec delivering no frame...");
@@ -83,30 +88,150 @@ impl Codec for WsCodec {
 	fn encode(&mut self, msg: Self::Out, buf: &mut Vec<u8>)
 			 -> io::Result<()>
 	{
-        let frame = wsframe::WebSocketFrame::new(
-            msg.as_slice(),
-            wsframe::FrameType::Data,
-            wsframe::OpType::Binary
-            );
-        buf.extend(frame.to_bytes());
+        buf.extend(msg.to_bytes());
         Ok(())
 	}
 }
 
 pub struct WsProto;
 
-use tokio_core::io::{Io, Framed};
+#[derive(Clone)]
+pub enum WsPayload {
+	Text(String),
+	Binary(Vec<u8>),
+}
+
+pub struct WsTransport<T> {
+    // The upstream framed transport
+    upstream: T,
+    pongs: VecDeque< WsPayload >, // This should be "Binary" data
+}
+
+// Transport wrapper to support control frames, taken from 
+// https://github.com/tokio-rs/tokio-line/blob/master/simple/examples/ping_pong.rs
+impl<T> Stream for WsTransport<T>
+    where T: Stream<Item = WebSocketFrame, Error = io::Error>,
+          T: Sink<SinkItem = WebSocketFrame, SinkError = io::Error>,
+{
+    type Item = WsPayload;
+    type Error = io::Error;
+
+    fn poll(&mut self) -> futures::Poll<Option<WsPayload>, io::Error> {
+        loop {
+            match try_ready!(self.upstream.poll()) {
+                Some(ref msg) if msg.op_type() == wsframe::OpType::Ping => {
+                    // intercept ping messages
+                    let ws_payload = msg.payload();
+                    self.pongs.push_back( WsPayload::Binary(ws_payload) );
+                    // Try flushing the pong, only bubble up errors
+                    try!(self.poll_complete());
+                }
+                Some(ref msg) => {
+                    match msg.op_type() {
+                        wsframe::OpType::Binary => {
+                            return Ok(Async::Ready(Some(WsPayload::Binary(msg.payload()))));
+                        }
+                        wsframe::OpType::Text => {
+                            return Ok(Async::Ready(Some(WsPayload::Text(String::from_utf8(msg.payload()).unwrap()))));
+                        }
+                        _ => {
+                            return Err( io::Error::new(io::ErrorKind::Other, "Expected Binary or Text WS frame.") );
+                        }
+                    }
+                }
+                None => { return Ok(Async::Ready(None)); }
+            }
+        }
+    }
+}
+
+impl<T> Sink for WsTransport<T>
+    where T: Sink<SinkItem = WebSocketFrame, SinkError = io::Error>,
+{
+    type SinkItem = WsPayload;
+    type SinkError = io::Error;
+
+    fn start_send(&mut self, item: WsPayload) -> StartSend<WsPayload, io::Error> {
+        // Only accept the write if there are no pending pongs
+        if self.pongs.len() > 0 {
+            return Ok(AsyncSink::NotReady(item));
+        }
+
+        // If there are no pending pongs, then send the item upstream
+        match item {
+            WsPayload::Text(string_payload) => {
+                let frame = WebSocketFrame::new(
+                    string_payload.as_bytes(),
+                    wsframe::FrameType::Data,
+                    wsframe::OpType::Text);
+                self.upstream.start_send(frame).map(move |s| -> AsyncSink<WsPayload> {
+                    match s {
+                        AsyncSink::Ready => AsyncSink::Ready,
+                        AsyncSink::NotReady(_) => AsyncSink::NotReady(WsPayload::Text(string_payload))
+                    }
+                })
+            }
+            WsPayload::Binary(bytes_payload) => {
+                let frame = WebSocketFrame::new(
+                    bytes_payload.as_slice(),
+                    wsframe::FrameType::Data,
+                    wsframe::OpType::Binary);
+                self.upstream.start_send(frame).map(|s| {
+                    match s {
+                        AsyncSink::Ready => AsyncSink::Ready,
+                        AsyncSink::NotReady(_) => AsyncSink::NotReady(WsPayload::Binary(bytes_payload))
+                    }
+                })
+            }
+        }
+    }
+
+    fn poll_complete(&mut self) -> Poll<(), io::Error> {
+        while let Some(payload) = self.pongs.pop_front() {
+            // Try to send the pong upstream
+            match payload {
+                WsPayload::Binary(b) => {
+                    let pong = WebSocketFrame::new(b.as_slice(), wsframe::FrameType::Control, wsframe::OpType::Pong);
+                    let res = try!(self.upstream.start_send(pong));
+
+                    if !res.is_ready() {
+                        // The upstream is not ready to accept new items
+                        break;
+                    }
+                }
+                WsPayload::Text(t) => {
+                    let pong = WebSocketFrame::new(t.as_bytes(), wsframe::FrameType::Control, wsframe::OpType::Pong);
+                    let res = try!(self.upstream.start_send(pong));
+
+                    if !res.is_ready() {
+                        // The upstream is not ready to accept new items
+                        break;
+                    }
+                }
+            }
+        }
+        // Call poll_complete on the upstream
+        //
+        // If there are remaining pongs to send, this call may create additional
+        // capacity. One option could be to attempt to send the pongs again.
+        // However, if a `start_send` returned NotReady, and this poll_complete
+        // *did* create additional capacity in the upstream, then *our*
+        // `poll_complete` will get called again shortly.
+
+        self.upstream.poll_complete()
+    }
+}
 
     // When created by TcpServer, "T" is "TcpStream"
 impl<T: Io + Send + 'static> ServerProto<T> for WsProto {
     /// For this protocol style, `Request` matches the codec `In` type
-    type Request = Vec<u8>;
+    type Request = WsPayload;
 
-    /// For this protocol style, `Response` matches the coded `Out` type
-    type Response = Vec<u8>;
+    /// For this protocol style, `Response` matches the codec `Out` type
+    type Response = WsPayload;
 
     /// A bit of boilerplate to hook in the codec:
-    type Transport = Framed<T, WsCodec>;
+    type Transport = WsTransport<Framed<T, WsCodec>>;
     type BindTransport = Box<Future<Item = Self::Transport, 
                                     Error = io::Error>>;
 
@@ -157,7 +282,8 @@ impl<T: Io + Send + 'static> ServerProto<T> for WsProto {
             }).and_then(|transport| {
                 let socket = transport.into_inner();
                 let ws_transport = socket.framed(WsCodec);
-                return Box::new(future::ok(ws_transport)) as Self::BindTransport;
+	            let transport = WsTransport{ upstream: ws_transport, pongs: VecDeque::new() };	
+                return Box::new(future::ok(transport)) as Self::BindTransport;
             });
 
         Box::new(handshake)
