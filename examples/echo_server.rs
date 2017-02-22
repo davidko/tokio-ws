@@ -17,8 +17,8 @@ use futures::{future, Future, BoxFuture};
 
 impl Service for Echo {
     // These types must match the corresponding protocol types:
-    type Request = Vec<u8>;
-    type Response = Vec<u8>;
+    type Request = tokio_ws::WsPayload;
+    type Response = tokio_ws::WsPayload;
 
     // For non-streaming protocols, service errors are always io::Error
     type Error = io::Error;
